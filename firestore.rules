@@ -1,0 +1,39 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // mahasiswa/{pi_username}  -> profil akademik, IPK, KTM digital
+    // uid pada request.auth berasal dari Firebase Custom Token yang di-mint
+    // oleh Cloud Function `api` SETELAH memverifikasi access token Pi Network
+    // ke Pi Platform API (bukan dari client). uid == pi_username.
+    match /mahasiswa/{piUsername} {
+      allow read: if request.auth != null && request.auth.uid == piUsername;
+
+      // Field akademik sensitif (ipk, nilai, presensi, sgtBalanceCache)
+      // hanya boleh ditulis oleh Cloud Functions (Admin SDK, bypass rules).
+      // Client TIDAK PERNAH boleh menulis langsung ke sini.
+      allow write: if false;
+
+      match /nilai/{mataKuliahId} {
+        allow read: if request.auth != null && request.auth.uid == piUsername;
+        allow write: if false;
+      }
+
+      match /presensi/{sesiId} {
+        allow read: if request.auth != null && request.auth.uid == piUsername;
+        allow write: if false;
+      }
+
+      match /sgtTransaksi/{txId} {
+        allow read: if request.auth != null && request.auth.uid == piUsername;
+        allow write: if false;
+      }
+    }
+
+    // Semua koleksi lain: default deny.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
