@@ -1,0 +1,11 @@
+name = "portal-sagatama-hub"
+main = "src/index.js"
+compatibility_date = "2026-01-01"
+
+# Secrets (JANGAN ditulis di sini — set lewat CLI):
+#   wrangler secret put SA_PORTAL_SAGATAMA
+#   wrangler secret put SA_SIAKAD_KAMPUS_APP
+#   (tambah satu SA_<NAMA_APP> untuk tiap aplikasi spoke baru)
+
+[observability]
+enabled = true
