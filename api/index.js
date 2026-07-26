@@ -34,21 +34,38 @@ const admin = require('firebase-admin');
 // Settings -> Service Accounts -> Generate new private key) sebagai SATU
 // environment variable bernama FIREBASE_SERVICE_ACCOUNT (paste seluruh isi
 // file .json di situ, sebagai string).
+let initError = null;
 if (!admin.apps.length) {
   const raw = process.env.FIREBASE_SERVICE_ACCOUNT;
   if (!raw) {
-    console.error(
-      'FIREBASE_SERVICE_ACCOUNT belum di-set di Environment Variables Vercel.'
-    );
+    // PENTING: Vercel tidak punya Application Default Credentials seperti
+    // Cloud Functions. Tanpa FIREBASE_SERVICE_ACCOUNT, admin SDK akan gagal
+    // diam-diam saat request PERTAMA ke Firestore/Auth (bukan saat cold
+    // start), jadi errornya kelihatan random. Kita bikin gagal cepat &
+    // eksplisit di sini supaya jelas dari log Vercel apa yang kurang.
+    initError = 'FIREBASE_SERVICE_ACCOUNT belum di-set di Environment Variables Vercel.';
+    console.error(initError);
+  } else {
+    try {
+      const serviceAccount = JSON.parse(raw);
+      admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+    } catch (e) {
+      initError = `FIREBASE_SERVICE_ACCOUNT tidak valid (gagal JSON.parse): ${e.message}`;
+      console.error(initError);
+    }
   }
-  const serviceAccount = raw ? JSON.parse(raw) : undefined;
-  admin.initializeApp({
-    credential: serviceAccount
-      ? admin.credential.cert(serviceAccount)
-      : admin.credential.applicationDefault(),
-  });
 }
-const db = admin.firestore();
+
+// Middleware paling awal: kalau init gagal, langsung balas 500 yang jelas
+// untuk SEMUA route, daripada tiap endpoint crash dengan pesan beda-beda.
+function guardInit(req, res, next) {
+  if (initError) {
+    return res.status(500).json({ error: `Konfigurasi server salah: ${initError}` });
+  }
+  next();
+}
+
+const db = admin.apps.length ? admin.firestore() : null;
 
 // -----------------------------------------------------------------------------
 // Konfigurasi lingkungan (set semua ini di Vercel -> Settings -> Environment Variables)
@@ -120,11 +137,33 @@ async function verifyPiAccessToken(accessToken) {
 }
 
 // -----------------------------------------------------------------------------
+// Helper: panggilan S2S (server-to-server) ke Pi Platform API untuk Pi
+// Payments asli (approve/complete/cancel). Ini BEDA dari verifyPiAccessToken
+// di atas — itu pakai Bearer <access token milik user>, ini pakai
+// `Authorization: Key <PI_API_KEY>` (App API Key dari Pi Developer Portal),
+// karena approve/complete/cancel adalah aksi App, bukan aksi User.
+// -----------------------------------------------------------------------------
+async function callPiPlatform(method, path, data) {
+  if (!PI_API_KEY) {
+    throw new Error('PI_API_KEY belum dikonfigurasi di environment Vercel.');
+  }
+  const response = await axios({
+    method,
+    url: `${PI_PLATFORM_API}${path}`,
+    data: data || undefined,
+    timeout: 10000,
+    headers: { Authorization: `Key ${PI_API_KEY}` },
+  });
+  return response.data;
+}
+
+// -----------------------------------------------------------------------------
 // Express app
 // -----------------------------------------------------------------------------
 const app = express();
 app.use(cors({ origin: true }));
 app.use(express.json());
+app.use(guardInit);
 
 // Vercel meneruskan request dengan path lengkap "/api/auth/pi-login".
 // Route di bawah didefinisikan tanpa prefix "/api" (mis. "/auth/pi-login"),
@@ -389,6 +428,180 @@ app.post('/webhook/sgt-sync', async (req, res) => {
   } catch (err) {
     console.error('webhook sgt-sync error', err);
     return res.status(500).json({ error: 'Gagal memproses webhook.' });
+  }
+});
+
+// =============================================================================
+// 7. PI PAYMENTS ASLI — topup SGT pakai Pi sungguhan (U2A: user-to-app)
+// =============================================================================
+// Alur: frontend panggil Pi.createPayment({...}, callbacks). Pi SDK akan
+// memanggil balik onReadyForServerApproval(paymentId) lalu
+// onReadyForServerCompletion(paymentId, txid) — dua callback itu masing2
+// harus fetch ke /payments/approve dan /payments/complete di bawah ini.
+// onCancel di frontend -> /payments/cancel. onIncompletePaymentFound (saat
+// Pi.init menemukan payment nyantol dari sesi sebelumnya) -> /payments/incomplete-action.
+//
+// Setiap payment dicatat di koleksi Firestore top-level `piPayments/{paymentId}`
+// supaya idempotent (tidak double-credit) dan bisa direkonsiliasi manual bila perlu.
+
+app.post('/payments/approve', requireFirebaseAuth, async (req, res) => {
+  const piUsername = req.piUsername;
+  const { paymentId, purpose, refId } = req.body;
+  if (!paymentId) return res.status(400).json({ error: 'paymentId wajib dikirim.' });
+
+  try {
+    // Ambil detail payment LANGSUNG dari Pi Platform (bukan percaya body
+    // dari client) supaya amount & pemilik payment terverifikasi server-side.
+    const payment = await callPiPlatform('GET', `/payments/${paymentId}`);
+
+    await db.collection('piPayments').doc(paymentId).set({
+      paymentId,
+      piUsername,
+      amount: payment.amount,
+      purpose: purpose || 'topup_sgt',
+      refId: refId || null,
+      status: 'approving',
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    await callPiPlatform('POST', `/payments/${paymentId}/approve`);
+    await db.collection('piPayments').doc(paymentId).update({ status: 'approved' });
+
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('payments/approve error', err.response?.data || err.message);
+    return res.status(502).json({ error: 'Gagal approve payment ke Pi Platform.' });
+  }
+});
+
+app.post('/payments/complete', requireFirebaseAuth, async (req, res) => {
+  const piUsername = req.piUsername;
+  const { paymentId, txid } = req.body;
+  if (!paymentId || !txid) {
+    return res.status(400).json({ error: 'paymentId dan txid wajib dikirim.' });
+  }
+
+  const payRef = db.collection('piPayments').doc(paymentId);
+
+  try {
+    const snap = await payRef.get();
+    if (!snap.exists) return res.status(404).json({ error: 'Payment tidak dikenal (belum di-approve?).' });
+    const payment = snap.data();
+
+    if (payment.piUsername !== piUsername) {
+      return res.status(403).json({ error: 'Payment ini bukan milik user yang login.' });
+    }
+    if (payment.status === 'completed') {
+      return res.json({ success: true, alreadyCompleted: true });
+    }
+
+    await callPiPlatform('POST', `/payments/${paymentId}/complete`, { txid });
+
+    // Kreditkan SGT setara Pi yang dibayar. Sesuaikan rate konversi di sini
+    // kalau 1 Pi != 1 SGT.
+    try {
+      const result = await callPortalSagatama('POST', '/ledger/credit', {
+        piUsername,
+        amount: payment.amount,
+        reason: `kampus-sagatama:pi-payment:${payment.purpose}`,
+        refId: paymentId,
+      });
+      await payRef.update({
+        status: 'completed',
+        txid,
+        newBalance: result.newBalance ?? null,
+        completedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      return res.json({ success: true, newBalance: result.newBalance ?? null });
+    } catch (ledgerErr) {
+      // Payment sudah SAH selesai di sisi Pi — jangan gagalkan response ke
+      // user, tapi tandai supaya bisa direkonsiliasi manual ke ledger.
+      console.error('Kredit SGT gagal setelah payment complete', ledgerErr.message);
+      await payRef.update({
+        status: 'completed_ledger_failed',
+        txid,
+        completedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      return res.status(207).json({
+        success: true,
+        warning: 'Pembayaran Pi berhasil, tapi kredit SGT tertunda dan akan direkonsiliasi manual.',
+      });
+    }
+  } catch (err) {
+    console.error('payments/complete error', err.response?.data || err.message);
+    return res.status(502).json({ error: 'Gagal menyelesaikan payment ke Pi Platform.' });
+  }
+});
+
+app.post('/payments/cancel', requireFirebaseAuth, async (req, res) => {
+  const piUsername = req.piUsername;
+  const { paymentId, reason } = req.body;
+  if (!paymentId) return res.status(400).json({ error: 'paymentId wajib dikirim.' });
+
+  try {
+    await callPiPlatform('POST', `/payments/${paymentId}/cancel`);
+
+    const payRef = db.collection('piPayments').doc(paymentId);
+    const snap = await payRef.get();
+    if (snap.exists && snap.data().piUsername === piUsername) {
+      await payRef.update({
+        status: 'cancelled',
+        cancelReason: reason || 'user_cancelled',
+        cancelledAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    }
+
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('payments/cancel error', err.response?.data || err.message);
+    return res.status(502).json({ error: 'Gagal membatalkan payment ke Pi Platform.' });
+  }
+});
+
+// Dipanggil dari onIncompletePaymentFound() di frontend (Pi.init menemukan
+// payment nyantol dari sesi/reload sebelumnya). Kita tanya status aslinya
+// ke Pi Platform, lalu selesaikan atau batalkan sesuai kondisi.
+app.post('/payments/incomplete-action', requireFirebaseAuth, async (req, res) => {
+  const piUsername = req.piUsername;
+  const { paymentId } = req.body;
+  if (!paymentId) return res.status(400).json({ error: 'paymentId wajib dikirim.' });
+
+  try {
+    const payment = await callPiPlatform('GET', `/payments/${paymentId}`);
+    const txid = payment.transaction?.txid;
+
+    if (txid) {
+      // Sudah ada transaksi di blockchain -> selesaikan.
+      await callPiPlatform('POST', `/payments/${paymentId}/complete`, { txid });
+      await db.collection('piPayments').doc(paymentId).set(
+        {
+          paymentId,
+          piUsername,
+          amount: payment.amount,
+          status: 'completed',
+          txid,
+          completedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+      return res.json({ success: true, resolved: 'completed' });
+    }
+
+    // Belum ada transaksi -> aman dibatalkan.
+    await callPiPlatform('POST', `/payments/${paymentId}/cancel`);
+    await db.collection('piPayments').doc(paymentId).set(
+      {
+        paymentId,
+        piUsername,
+        status: 'cancelled',
+        cancelledAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+    return res.json({ success: true, resolved: 'cancelled' });
+  } catch (err) {
+    console.error('payments/incomplete-action error', err.response?.data || err.message);
+    return res.status(502).json({ error: 'Gagal memproses payment yang belum selesai.' });
   }
 });
 
