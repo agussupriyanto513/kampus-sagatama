@@ -12,12 +12,12 @@
 //    verifyIdToken() di backend, bukan di sini.
 // -----------------------------------------------------------------------
 const firebaseConfig = {
-  apiKey: 'GANTI_DENGAN_API_KEY',
-  authDomain: 'kampus-sagatama.firebaseapp.com',
-  projectId: 'kampus-sagatama',
-  storageBucket: 'kampus-sagatama.appspot.com',
-  messagingSenderId: 'GANTI_DENGAN_SENDER_ID',
-  appId: 'GANTI_DENGAN_APP_ID',
+    apiKey: "AIzaSyDNWOochfAyHjBYUNyq2IAYhA9p7Ie834M",
+    authDomain: "portal-sagatama.firebaseapp.com",
+    projectId: "portal-sagatama",
+    storageBucket: "portal-sagatama.firebasestorage.app",
+    messagingSenderId: "372845954028",
+    appId: "1:372845954028:web:189f2a3127ea8189b9f6c9"
 };
 firebase.initializeApp(firebaseConfig);
 
