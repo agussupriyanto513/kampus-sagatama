@@ -31,6 +31,14 @@ service cloud.firestore {
       }
     }
 
+    // piPayments/{paymentId} -> riwayat Pi Payments asli (topup SGT, dsb).
+    // Ditulis HANYA oleh backend (Admin SDK, bypass rules) lewat
+    // /api/payments/approve|complete|cancel|incomplete-action.
+    match /piPayments/{paymentId} {
+      allow read: if request.auth != null && request.auth.uid == resource.data.piUsername;
+      allow write: if false;
+    }
+
     // Semua koleksi lain: default deny.
     match /{document=**} {
       allow read, write: if false;

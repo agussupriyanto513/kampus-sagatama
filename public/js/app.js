@@ -192,6 +192,41 @@ async function handleClaimSertifikat(cert, btn) {
   }
 }
 
+function handleTopupPi() {
+  const amountStr = prompt('Berapa Pi yang mau kamu top up ke saldo SGT? (contoh: 1)');
+  const amount = Number(amountStr);
+  if (!amount || amount <= 0) return;
+
+  const btn = $('btnTopupPi');
+  btn.disabled = true;
+  btn.textContent = 'Menunggu Pi Browser…';
+
+  window.KampusSagatama.payments.createPayment(
+    amount,
+    `Top up ${amount} Pi -> SGT (kampus-sagatama)`,
+    'topup_sgt',
+    {
+      onSuccess: (newBalance) => {
+        toast(`Top up berhasil! Saldo SGT sekarang ${newBalance ?? '—'}.`);
+        if (newBalance != null) $('statSaldo').textContent = `${newBalance} SGT`;
+        else refreshBalance();
+        btn.disabled = false;
+        btn.textContent = 'Top Up via Pi';
+      },
+      onCancel: () => {
+        toast('Top up dibatalkan.');
+        btn.disabled = false;
+        btn.textContent = 'Top Up via Pi';
+      },
+      onError: (err) => {
+        toast(err.message || 'Top up gagal.', true);
+        btn.disabled = false;
+        btn.textContent = 'Top Up via Pi';
+      },
+    }
+  );
+}
+
 async function refreshBalance() {
   try {
     const { balance } = await window.KampusSagatama.sgt.getBalance();
@@ -221,6 +256,8 @@ async function loadDashboardData(uid) {
     toast('Gagal memuat data akademik. Coba muat ulang halaman.', true);
   }
 }
+
+$('btnTopupPi').addEventListener('click', handleTopupPi);
 
 $('btnLogin').addEventListener('click', async () => {
   const btn = $('btnLogin');

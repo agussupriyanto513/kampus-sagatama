@@ -1,5 +1,8 @@
 {
   "outputDirectory": "public",
+  "rewrites": [
+    { "source": "/api/(.*)", "destination": "/api/index" }
+  ],
   "headers": [
     {
       "source": "/(.*).(js|css)",

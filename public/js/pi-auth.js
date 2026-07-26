@@ -26,11 +26,21 @@ window.KampusSagatama = window.KampusSagatama || {};
   let piUser = null; // { uid, username } dari Pi SDK
   let firebaseUser = null; // hasil signInWithCustomToken
 
-  function onIncompletePaymentFound(payment) {
+  async function onIncompletePaymentFound(payment) {
     console.warn('[Pi] Ditemukan pembayaran belum selesai:', payment);
-    // Untuk kasus kampus: pembayaran SGT dilakukan lewat backend kita sendiri
-    // (bukan Pi Payment native), jadi ini umumnya hanya relevan bila kelak
-    // ditambahkan pembayaran Pi asli (mis. biaya kuliah via Pi).
+    // Bisa dipanggil Pi SDK SEBELUM login selesai (mis. saat Pi.init),
+    // jadi kita jaga-jaga kalau belum ada Firebase ID token.
+    try {
+      if (!firebase.auth().currentUser) return;
+      const idToken = await getIdToken();
+      await fetch('/api/payments/incomplete-action', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${idToken}` },
+        body: JSON.stringify({ paymentId: payment.identifier }),
+      });
+    } catch (err) {
+      console.error('[Pi] Gagal memproses payment tertunda', err);
+    }
   }
 
   async function initPiSdk() {
