@@ -1,43 +1,58 @@
 'use strict';
 
 /**
- * kampus-sagatama — functions/index.js
+ * api/index.js — kampus-sagatama backend, versi VERCEL SERVERLESS FUNCTION.
  * ---------------------------------------------------------------------------
- * Backend tunggal (Firebase Cloud Functions + Express) untuk portal akademik
- * "kampus-sagatama". Tanggung jawab utama:
+ * Ini adalah konversi dari functions/index.js (format Firebase Cloud
+ * Functions) menjadi format yang benar-benar jalan di Vercel:
+ *   - Satu Express app, dibungkus `serverless-http` supaya bisa dipanggil
+ *     sebagai Vercel Serverless Function.
+ *   - Semua request ke /api/** diarahkan ke file ini lewat rewrite di
+ *     vercel.json ({ source: "/api/(.*)", destination: "/api/index" }).
+ *   - Middleware kecil di bawah menghapus prefix "/api" dari req.url supaya
+ *     definisi route (app.post('/auth/pi-login', ...)) tidak perlu diubah.
  *
- *   1. Memverifikasi login Pi Network (access token) LANGSUNG ke Pi Platform
- *      API di sisi server — frontend tidak pernah dipercaya begitu saja.
- *   2. Mint Firebase Custom Token (uid = pi_username) supaya Firestore
- *      Security Rules bisa memvalidasi req.auth.uid tanpa password apapun.
- *   3. Menjadi satu-satunya pihak yang menyimpan & memakai
- *      SGT_INTERNAL_SECRET untuk komunikasi Server-to-Server (HMAC) ke
- *      `portal-sagatama` (ledger SGT terpusat untuk seluruh ekosistem
- *      Sagatama: sagatama-mart, sagatama-games, hidayatulamin,
- *      website-sagatama, dan kampus-sagatama).
- *
- * Secret ini TIDAK PERNAH dikirim ke browser. Frontend hanya bicara ke
- * endpoint /api/** milik Firebase Hosting (lihat rewrites di firebase.json),
- * yang diteruskan ke function `api` di file ini.
+ * Logika bisnis (verifikasi Pi, mint custom token, ledger SGT, dst) TIDAK
+ * diubah dari functions/index.js — hanya lapisan pembungkus & init Firebase
+ * Admin yang berbeda (Vercel tidak punya Application Default Credentials
+ * otomatis seperti Cloud Functions, jadi service account harus di-set lewat
+ * environment variable).
  * ---------------------------------------------------------------------------
  */
 
-const functions = require('firebase-functions');
-const { logger } = functions;
 const express = require('express');
+const serverless = require('serverless-http');
 const cors = require('cors');
 const axios = require('axios');
 const crypto = require('crypto');
 const admin = require('firebase-admin');
 
-admin.initializeApp();
+// -----------------------------------------------------------------------------
+// Init Firebase Admin (khusus untuk lingkungan Vercel)
+// -----------------------------------------------------------------------------
+// Di Vercel, taruh isi JSON service account (Firebase Console -> Project
+// Settings -> Service Accounts -> Generate new private key) sebagai SATU
+// environment variable bernama FIREBASE_SERVICE_ACCOUNT (paste seluruh isi
+// file .json di situ, sebagai string).
+if (!admin.apps.length) {
+  const raw = process.env.FIREBASE_SERVICE_ACCOUNT;
+  if (!raw) {
+    console.error(
+      'FIREBASE_SERVICE_ACCOUNT belum di-set di Environment Variables Vercel.'
+    );
+  }
+  const serviceAccount = raw ? JSON.parse(raw) : undefined;
+  admin.initializeApp({
+    credential: serviceAccount
+      ? admin.credential.cert(serviceAccount)
+      : admin.credential.applicationDefault(),
+  });
+}
 const db = admin.firestore();
 
 // -----------------------------------------------------------------------------
-// Konfigurasi lingkungan
+// Konfigurasi lingkungan (set semua ini di Vercel -> Settings -> Environment Variables)
 // -----------------------------------------------------------------------------
-// Gunakan `firebase functions:secrets:set SGT_INTERNAL_SECRET` dkk di production.
-// Untuk local dev, taruh nilai ini di functions/.env (lihat .env.example di root).
 const {
   SGT_INTERNAL_SECRET,
   PORTAL_SAGATAMA_URL,
@@ -61,10 +76,6 @@ const SERTIFIKAT_HARGA_DEFAULT_SGT = 25;
 // -----------------------------------------------------------------------------
 // Helper: HMAC signing untuk request S2S ke portal-sagatama
 // -----------------------------------------------------------------------------
-/**
- * Menandatangani payload dengan HMAC-SHA256 memakai SGT_INTERNAL_SECRET.
- * portal-sagatama memverifikasi signature ini sebelum memproses mutasi ledger.
- */
 function signPayload(bodyString, timestamp) {
   return crypto
     .createHmac('sha256', SGT_INTERNAL_SECRET)
@@ -72,16 +83,10 @@ function signPayload(bodyString, timestamp) {
     .digest('hex');
 }
 
-/**
- * Melakukan request S2S ke portal-sagatama dengan header:
- *   X-SGT-Client     : identitas aplikasi pemanggil (kampus-sagatama)
- *   X-SGT-Timestamp  : unix ms, mencegah replay attack (portal menolak > 5 menit)
- *   X-SGT-Signature  : HMAC-SHA256(timestamp + body, SGT_INTERNAL_SECRET)
- */
 async function callPortalSagatama(method, path, data) {
   if (!SGT_INTERNAL_SECRET || !PORTAL_SAGATAMA_URL) {
     throw new Error(
-      'SGT_INTERNAL_SECRET / PORTAL_SAGATAMA_URL belum dikonfigurasi di environment functions.'
+      'SGT_INTERNAL_SECRET / PORTAL_SAGATAMA_URL belum dikonfigurasi di environment Vercel.'
     );
   }
   const timestamp = Date.now().toString();
@@ -111,7 +116,6 @@ async function verifyPiAccessToken(accessToken) {
     headers: { Authorization: `Bearer ${accessToken}` },
     timeout: 8000,
   });
-  // data => { uid, username, credentials, ... } — sesuai dokumentasi Pi Platform
   return data;
 }
 
@@ -122,11 +126,16 @@ const app = express();
 app.use(cors({ origin: true }));
 app.use(express.json());
 
-/**
- * Middleware: memverifikasi Firebase ID Token (bukan Pi access token) yang
- * dikirim client setelah signInWithCustomToken(...) di frontend.
- * req.piUsername berisi uid (== pi_username) hasil verifikasi.
- */
+// Vercel meneruskan request dengan path lengkap "/api/auth/pi-login".
+// Route di bawah didefinisikan tanpa prefix "/api" (mis. "/auth/pi-login"),
+// jadi kita lepas dulu prefix-nya di sini.
+app.use((req, _res, next) => {
+  if (req.url.startsWith('/api')) {
+    req.url = req.url.slice(4) || '/';
+  }
+  next();
+});
+
 async function requireFirebaseAuth(req, res, next) {
   try {
     const header = req.headers.authorization || '';
@@ -138,7 +147,7 @@ async function requireFirebaseAuth(req, res, next) {
     req.piUsername = decoded.uid;
     next();
   } catch (err) {
-    logger.warn('Auth verification failed', err);
+    console.warn('Auth verification failed', err.message);
     return res.status(401).json({ error: 'Token tidak valid atau kedaluwarsa.' });
   }
 }
@@ -153,7 +162,6 @@ app.post('/auth/pi-login', async (req, res) => {
       return res.status(400).json({ error: 'accessToken wajib dikirim.' });
     }
 
-    // Verifikasi token LANGSUNG ke Pi Platform API (server-side, tidak percaya client)
     const piUser = await verifyPiAccessToken(accessToken);
     const piUsername = piUser.username;
     if (!piUsername) {
@@ -164,7 +172,6 @@ app.post('/auth/pi-login', async (req, res) => {
     const snap = await mahasiswaRef.get();
 
     if (!snap.exists) {
-      // Mahasiswa baru: buat profil akademik default + daftarkan ke portal-sagatama
       await mahasiswaRef.set({
         piUsername,
         piUid: piUser.uid || null,
@@ -179,19 +186,16 @@ app.post('/auth/pi-login', async (req, res) => {
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
       });
 
-      // Beritahu portal-sagatama bahwa user ini kini aktif juga di kampus-sagatama
-      // (best-effort — kegagalan di sini tidak boleh menggagalkan proses login).
       try {
         await callPortalSagatama('POST', '/users/register-app', {
           piUsername,
           app: SGT_CLIENT_ID,
         });
       } catch (syncErr) {
-        logger.warn('Gagal sinkronisasi user baru ke portal-sagatama', syncErr.message);
+        console.warn('Gagal sinkronisasi user baru ke portal-sagatama', syncErr.message);
       }
     }
 
-    // Mint Firebase Custom Token — uid = pi_username, dipakai Firestore Rules
     const customToken = await admin.auth().createCustomToken(piUsername, {
       app: SGT_CLIENT_ID,
     });
@@ -199,13 +203,13 @@ app.post('/auth/pi-login', async (req, res) => {
     const profile = (await mahasiswaRef.get()).data();
     return res.json({ customToken, profile });
   } catch (err) {
-    logger.error('pi-login error', err.response?.data || err.message);
+    console.error('pi-login error', err.response?.data || err.message);
     return res.status(500).json({ error: 'Login Pi Network gagal diproses.' });
   }
 });
 
 // =============================================================================
-// 2. AKADEMIK — Profil, nilai, presensi (baca saja dari sisi client)
+// 2. AKADEMIK — Profil, nilai
 // =============================================================================
 app.get('/akademik/profil', requireFirebaseAuth, async (req, res) => {
   try {
@@ -213,7 +217,7 @@ app.get('/akademik/profil', requireFirebaseAuth, async (req, res) => {
     if (!snap.exists) return res.status(404).json({ error: 'Profil tidak ditemukan.' });
     return res.json(snap.data());
   } catch (err) {
-    logger.error('profil error', err);
+    console.error('profil error', err);
     return res.status(500).json({ error: 'Gagal mengambil profil akademik.' });
   }
 });
@@ -228,13 +232,13 @@ app.get('/akademik/nilai', requireFirebaseAuth, async (req, res) => {
       .get();
     return res.json(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
   } catch (err) {
-    logger.error('nilai error', err);
+    console.error('nilai error', err);
     return res.status(500).json({ error: 'Gagal mengambil data nilai.' });
   }
 });
 
 // =============================================================================
-// 3. SGT — Saldo real-time (proxy ke portal-sagatama, di-cache di Firestore)
+// 3. SGT — Saldo real-time
 // =============================================================================
 app.get('/sgt/balance', requireFirebaseAuth, async (req, res) => {
   const piUsername = req.piUsername;
@@ -249,8 +253,7 @@ app.get('/sgt/balance', requireFirebaseAuth, async (req, res) => {
 
     return res.json({ piUsername, balance, source: 'portal-sagatama' });
   } catch (err) {
-    logger.warn('portal-sagatama unreachable, fallback ke cache', err.message);
-    // Fallback: portal pusat sedang down -> tampilkan cache terakhir agar UI tidak rusak
+    console.warn('portal-sagatama unreachable, fallback ke cache', err.message);
     const cached = await db.collection('mahasiswa').doc(piUsername).get();
     const balance = cached.exists ? cached.data().sgtBalanceCache || 0 : 0;
     return res.json({ piUsername, balance, source: 'cache', warning: 'Saldo mungkin tidak real-time.' });
@@ -258,7 +261,7 @@ app.get('/sgt/balance', requireFirebaseAuth, async (req, res) => {
 });
 
 // =============================================================================
-// 4. SGT — Reward akademik (presensi / tugas / ujian)
+// 4. SGT — Reward akademik
 // =============================================================================
 app.post('/sgt/reward', requireFirebaseAuth, async (req, res) => {
   const piUsername = req.piUsername;
@@ -276,7 +279,6 @@ app.post('/sgt/reward', requireFirebaseAuth, async (req, res) => {
   const txRef = mahasiswaRef.collection('sgtTransaksi').doc(`${type}_${refId}`);
 
   try {
-    // Cegah reward ganda untuk refId yang sama (idempoten via deterministic doc id)
     const existing = await txRef.get();
     if (existing.exists) {
       return res.status(409).json({ error: 'Reward untuk aktivitas ini sudah pernah diberikan.' });
@@ -300,7 +302,7 @@ app.post('/sgt/reward', requireFirebaseAuth, async (req, res) => {
 
     return res.json({ success: true, amount, newBalance: result.newBalance ?? null });
   } catch (err) {
-    logger.error('reward error', err.response?.data || err.message);
+    console.error('reward error', err.response?.data || err.message);
     return res.status(502).json({ error: 'Gagal menyalurkan reward SGT ke portal-sagatama.' });
   }
 });
@@ -341,20 +343,17 @@ app.post('/sgt/klaim-sertifikat', requireFirebaseAuth, async (req, res) => {
 
     return res.json({ success: true, sertifikatId, newBalance: result.newBalance ?? null });
   } catch (err) {
-    // portal-sagatama akan menolak (400/402) jika saldo SGT tidak cukup
     if (err.response?.status === 402) {
       return res.status(402).json({ error: 'Saldo SGT tidak mencukupi untuk klaim sertifikat ini.' });
     }
-    logger.error('klaim-sertifikat error', err.response?.data || err.message);
+    console.error('klaim-sertifikat error', err.response?.data || err.message);
     return res.status(502).json({ error: 'Gagal memproses klaim sertifikat.' });
   }
 });
 
 // =============================================================================
-// 6. Webhook masuk (opsional) — portal-sagatama -> kampus-sagatama
+// 6. Webhook masuk — portal-sagatama -> kampus-sagatama
 // =============================================================================
-// Dipakai jika portal-sagatama ingin mendorong update saldo secara proaktif
-// (mis. user top-up SGT dari sagatama-mart, kampus-sagatama perlu tahu).
 app.post('/webhook/sgt-sync', async (req, res) => {
   try {
     const signature = req.headers['x-sgt-signature'];
@@ -364,7 +363,6 @@ app.post('/webhook/sgt-sync', async (req, res) => {
     if (!signature || !timestamp) {
       return res.status(400).json({ error: 'Header signature/timestamp hilang.' });
     }
-    // Tolak request lawas (> 5 menit) untuk mencegah replay attack
     if (Math.abs(Date.now() - Number(timestamp)) > 5 * 60 * 1000) {
       return res.status(401).json({ error: 'Timestamp kedaluwarsa.' });
     }
@@ -389,17 +387,14 @@ app.post('/webhook/sgt-sync', async (req, res) => {
 
     return res.json({ success: true });
   } catch (err) {
-    logger.error('webhook sgt-sync error', err);
+    console.error('webhook sgt-sync error', err);
     return res.status(500).json({ error: 'Gagal memproses webhook.' });
   }
 });
 
-// Healthcheck sederhana untuk monitoring
+// Healthcheck sederhana
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', app: SGT_CLIENT_ID, piSandbox: PI_SANDBOX === 'true' });
 });
 
-exports.api = functions
-  .region('asia-southeast2')
-  .runWith({ secrets: ['SGT_INTERNAL_SECRET', 'PI_API_KEY'] })
-  .https.onRequest(app);
+module.exports = serverless(app);
