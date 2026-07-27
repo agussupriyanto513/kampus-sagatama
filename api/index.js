@@ -76,9 +76,21 @@ const {
   SGT_CLIENT_ID = 'kampus-sagatama',
   PI_API_KEY,
   PI_SANDBOX = 'true',
+  // Daftar pi_username yang diberi hak admin, dipisah koma, tanpa spasi.
+  ADMIN_PI_USERNAMES = '',
 } = process.env;
 
 const PI_PLATFORM_API = 'https://api.minepi.com/v2';
+
+const ADMIN_USERNAME_SET = new Set(
+  ADMIN_PI_USERNAMES.split(',')
+    .map((u) => u.trim().toLowerCase())
+    .filter(Boolean)
+);
+
+function isAdminUsername(piUsername) {
+  return ADMIN_USERNAME_SET.has(String(piUsername || '').toLowerCase());
+}
 
 // Tabel reward SGT akademik — sumber kebenaran ada di SERVER, bukan client,
 // supaya nilai reward tidak bisa dimanipulasi dari sisi browser.
@@ -184,11 +196,20 @@ async function requireFirebaseAuth(req, res, next) {
     }
     const decoded = await admin.auth().verifyIdToken(idToken);
     req.piUsername = decoded.uid;
+    req.decodedToken = decoded;
     next();
   } catch (err) {
     console.warn('Auth verification failed', err.message);
     return res.status(401).json({ error: 'Token tidak valid atau kedaluwarsa.' });
   }
+}
+
+/** Wajib dipasang SETELAH requireFirebaseAuth. Menolak non-admin dengan 403. */
+function requireAdmin(req, res, next) {
+  if (!req.decodedToken || req.decodedToken.admin !== true) {
+    return res.status(403).json({ error: 'Akses ditolak. Akun ini bukan admin.' });
+  }
+  next();
 }
 
 // =============================================================================
@@ -207,6 +228,8 @@ app.post('/auth/pi-login', async (req, res) => {
       return res.status(401).json({ error: 'Gagal memverifikasi identitas Pi Network.' });
     }
 
+    const isAdmin = isAdminUsername(piUsername);
+
     const mahasiswaRef = db.collection('mahasiswa').doc(piUsername);
     const snap = await mahasiswaRef.get();
 
@@ -220,6 +243,7 @@ app.post('/auth/pi-login', async (req, res) => {
         semester: 1,
         ipk: 0,
         status: 'aktif',
+        isAdmin,
         sgtBalanceCache: 0,
         sgtBalanceCachedAt: admin.firestore.FieldValue.serverTimestamp(),
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -233,14 +257,17 @@ app.post('/auth/pi-login', async (req, res) => {
       } catch (syncErr) {
         console.warn('Gagal sinkronisasi user baru ke portal-sagatama', syncErr.message);
       }
+    } else if (snap.data().isAdmin !== isAdmin) {
+      await mahasiswaRef.update({ isAdmin });
     }
 
     const customToken = await admin.auth().createCustomToken(piUsername, {
       app: SGT_CLIENT_ID,
+      admin: isAdmin,
     });
 
     const profile = (await mahasiswaRef.get()).data();
-    return res.json({ customToken, profile });
+    return res.json({ customToken, profile, isAdmin });
   } catch (err) {
     console.error('pi-login error', err.response?.data || err.message);
     return res.status(500).json({ error: 'Login Pi Network gagal diproses.' });
@@ -602,6 +629,196 @@ app.post('/payments/incomplete-action', requireFirebaseAuth, async (req, res) =>
   } catch (err) {
     console.error('payments/incomplete-action error', err.response?.data || err.message);
     return res.status(502).json({ error: 'Gagal memproses payment yang belum selesai.' });
+  }
+});
+
+// =============================================================================
+// 8. ADMIN — dilindungi requireFirebaseAuth + requireAdmin (whitelist
+//    ADMIN_PI_USERNAMES). Semua mutasi data mahasiswa & SGT WAJIB lewat sini.
+// =============================================================================
+
+app.get('/admin/whoami', requireFirebaseAuth, requireAdmin, async (req, res) => {
+  return res.json({ piUsername: req.piUsername, isAdmin: true });
+});
+
+app.get('/admin/stats', requireFirebaseAuth, requireAdmin, async (req, res) => {
+  try {
+    const totalSnap = await db.collection('mahasiswa').count().get();
+    const aktifSnap = await db.collection('mahasiswa').where('status', '==', 'aktif').get();
+    return res.json({
+      totalMahasiswa: totalSnap.data().count,
+      totalAktif: aktifSnap.size,
+    });
+  } catch (err) {
+    console.error('admin/stats error', err);
+    return res.status(500).json({ error: 'Gagal mengambil statistik.' });
+  }
+});
+
+app.get('/admin/mahasiswa', requireFirebaseAuth, requireAdmin, async (req, res) => {
+  try {
+    const limit = Math.min(Number(req.query.limit) || 100, 300);
+    const snap = await db.collection('mahasiswa').orderBy('createdAt', 'desc').limit(limit).get();
+    let items = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+
+    const search = (req.query.search || '').trim().toLowerCase();
+    if (search) {
+      items = items.filter(
+        (m) =>
+          m.piUsername?.toLowerCase().includes(search) ||
+          m.nama?.toLowerCase().includes(search) ||
+          m.nim?.toLowerCase().includes(search)
+      );
+    }
+
+    return res.json(items);
+  } catch (err) {
+    console.error('admin/mahasiswa list error', err);
+    return res.status(500).json({ error: 'Gagal mengambil daftar mahasiswa.' });
+  }
+});
+
+app.get('/admin/mahasiswa/:piUsername', requireFirebaseAuth, requireAdmin, async (req, res) => {
+  try {
+    const ref = db.collection('mahasiswa').doc(req.params.piUsername);
+    const snap = await ref.get();
+    if (!snap.exists) return res.status(404).json({ error: 'Mahasiswa tidak ditemukan.' });
+
+    const [nilaiSnap, txSnap, sertifSnap] = await Promise.all([
+      ref.collection('nilai').orderBy('semester', 'desc').get(),
+      ref.collection('sgtTransaksi').orderBy('createdAt', 'desc').limit(50).get(),
+      ref.collection('sertifikat').get(),
+    ]);
+
+    return res.json({
+      profil: { id: snap.id, ...snap.data() },
+      nilai: nilaiSnap.docs.map((d) => ({ id: d.id, ...d.data() })),
+      transaksi: txSnap.docs.map((d) => ({ id: d.id, ...d.data() })),
+      sertifikat: sertifSnap.docs.map((d) => ({ id: d.id, ...d.data() })),
+    });
+  } catch (err) {
+    console.error('admin/mahasiswa detail error', err);
+    return res.status(500).json({ error: 'Gagal mengambil detail mahasiswa.' });
+  }
+});
+
+const MAHASISWA_EDITABLE_FIELDS = ['nama', 'nim', 'prodi', 'semester', 'ipk', 'status'];
+
+app.patch('/admin/mahasiswa/:piUsername', requireFirebaseAuth, requireAdmin, async (req, res) => {
+  try {
+    const ref = db.collection('mahasiswa').doc(req.params.piUsername);
+    const snap = await ref.get();
+    if (!snap.exists) return res.status(404).json({ error: 'Mahasiswa tidak ditemukan.' });
+
+    const updates = {};
+    for (const field of MAHASISWA_EDITABLE_FIELDS) {
+      if (req.body[field] !== undefined) updates[field] = req.body[field];
+    }
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ error: 'Tidak ada field valid untuk diupdate.' });
+    }
+    if (updates.semester !== undefined) updates.semester = Number(updates.semester);
+    if (updates.ipk !== undefined) updates.ipk = Number(updates.ipk);
+
+    updates.updatedAt = admin.firestore.FieldValue.serverTimestamp();
+    updates.updatedBy = req.piUsername;
+
+    await ref.update(updates);
+    const fresh = await ref.get();
+    return res.json({ success: true, profil: { id: fresh.id, ...fresh.data() } });
+  } catch (err) {
+    console.error('admin/mahasiswa patch error', err);
+    return res.status(500).json({ error: 'Gagal mengupdate data mahasiswa.' });
+  }
+});
+
+app.post('/admin/mahasiswa/:piUsername/nilai', requireFirebaseAuth, requireAdmin, async (req, res) => {
+  try {
+    const { mataKuliah, sks, nilai, semester } = req.body;
+    if (!mataKuliah || nilai === undefined || semester === undefined) {
+      return res.status(400).json({ error: 'mataKuliah, nilai, dan semester wajib diisi.' });
+    }
+    const ref = db.collection('mahasiswa').doc(req.params.piUsername);
+    const parent = await ref.get();
+    if (!parent.exists) return res.status(404).json({ error: 'Mahasiswa tidak ditemukan.' });
+
+    const docRef = await ref.collection('nilai').add({
+      mataKuliah,
+      sks: Number(sks) || 0,
+      nilai,
+      semester: Number(semester),
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      createdBy: req.piUsername,
+    });
+
+    return res.json({ success: true, id: docRef.id });
+  } catch (err) {
+    console.error('admin/nilai add error', err);
+    return res.status(500).json({ error: 'Gagal menambah nilai.' });
+  }
+});
+
+app.delete(
+  '/admin/mahasiswa/:piUsername/nilai/:nilaiId',
+  requireFirebaseAuth,
+  requireAdmin,
+  async (req, res) => {
+    try {
+      await db
+        .collection('mahasiswa')
+        .doc(req.params.piUsername)
+        .collection('nilai')
+        .doc(req.params.nilaiId)
+        .delete();
+      return res.json({ success: true });
+    } catch (err) {
+      console.error('admin/nilai delete error', err);
+      return res.status(500).json({ error: 'Gagal menghapus nilai.' });
+    }
+  }
+);
+
+app.post('/admin/sgt/adjust', requireFirebaseAuth, requireAdmin, async (req, res) => {
+  const { piUsername, arah, amount, reason } = req.body;
+  if (!piUsername || !['credit', 'debit'].includes(arah) || !(Number(amount) > 0)) {
+    return res.status(400).json({ error: 'piUsername, arah (credit/debit), dan amount (>0) wajib diisi.' });
+  }
+
+  const mahasiswaRef = db.collection('mahasiswa').doc(piUsername);
+  const target = await mahasiswaRef.get();
+  if (!target.exists) return res.status(404).json({ error: 'Mahasiswa tidak ditemukan.' });
+
+  try {
+    const result = await callPortalSagatama('POST', `/ledger/${arah}`, {
+      piUsername,
+      amount: Number(amount),
+      reason: `kampus-sagatama:admin-adjust:${reason || 'tanpa-alasan'}`,
+    });
+
+    await mahasiswaRef.collection('sgtTransaksi').add({
+      type: 'admin_adjustment',
+      arah,
+      amount: Number(amount),
+      reason: reason || null,
+      adminUsername: req.piUsername,
+      portalTxId: result.txId || null,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    if (result.newBalance != null) {
+      await mahasiswaRef.update({
+        sgtBalanceCache: result.newBalance,
+        sgtBalanceCachedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    }
+
+    return res.json({ success: true, newBalance: result.newBalance ?? null });
+  } catch (err) {
+    if (err.response?.status === 402) {
+      return res.status(402).json({ error: 'Saldo SGT tidak mencukupi untuk debit ini.' });
+    }
+    console.error('admin/sgt/adjust error', err.response?.data || err.message);
+    return res.status(502).json({ error: 'Gagal menyesuaikan saldo SGT via portal-sagatama.' });
   }
 });
 

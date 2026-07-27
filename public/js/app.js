@@ -251,6 +251,7 @@ async function loadDashboardData(uid) {
     renderSertifikat();
     showDashboard();
     setConnected(true);
+    $('adminLink').hidden = !profil.isAdmin;
   } catch (err) {
     console.error(err);
     toast('Gagal memuat data akademik. Coba muat ulang halaman.', true);

@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Admin — Kampus Sagatama</title>
+<meta name="robots" content="noindex, nofollow" />
+<link rel="stylesheet" href="/css/style.css" />
+<link rel="stylesheet" href="/admin/css/admin.css" />
+
+<!-- Pi Network SDK resmi (dipakai untuk login admin, sama seperti login mahasiswa) -->
+<script src="https://sdk.minepi.com/pi-sdk.js"></script>
+
+<!-- Firebase (compat build) -->
+<script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-auth-compat.js"></script>
+</head>
+<body class="admin-body">
+
+<div class="admin-wrap">
+
+  <header class="admin-topbar">
+    <div class="brand">
+      <div class="brand-mark">S</div>
+      <div>
+        <div class="brand-name">Kampus <em>Sagatama</em></div>
+        <div class="brand-tag">Panel Admin · Akademik &amp; Ledger SGT</div>
+      </div>
+    </div>
+    <div class="admin-who" id="adminWho" hidden>
+      <span class="pi-dot live"></span>
+      <span id="adminWhoLabel">—</span>
+      <button class="btn-ghost-sm" id="btnLogout">Keluar</button>
+    </div>
+  </header>
+
+  <!-- ======================= GATE / LOGIN ADMIN ======================= -->
+  <section id="adminGate" class="admin-gate">
+    <div class="gate-eyebrow">Akses Terbatas</div>
+    <h1 class="gate-title">Masuk sebagai <em>admin</em></h1>
+    <p class="gate-sub">
+      Gunakan akun Pi Network yang sudah terdaftar di whitelist admin
+      (<code>ADMIN_PI_USERNAMES</code>) untuk membuka panel ini.
+    </p>
+    <button class="btn-login" id="btnAdminLogin">
+      <span>Masuk dengan Pi Network</span>
+    </button>
+    <div id="adminGateError" class="admin-error"></div>
+  </section>
+
+  <!-- ======================= DASHBOARD ADMIN ======================= -->
+  <main id="adminDashboard" class="admin-dashboard" hidden>
+
+    <div class="admin-stat-grid">
+      <div class="stat-card">
+        <div class="label">Total Mahasiswa</div>
+        <div class="value" id="statTotal">—</div>
+        <div class="sub">akun terdaftar</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Mahasiswa Aktif</div>
+        <div class="value pulse" id="statAktif">—</div>
+        <div class="sub">status: aktif</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Login sebagai</div>
+        <div class="value gold" id="statAdminUser" style="font-size:16px;">—</div>
+        <div class="sub">hak akses admin</div>
+      </div>
+    </div>
+
+    <div class="admin-toolbar">
+      <div class="section-label" style="margin:0;">Daftar Mahasiswa</div>
+      <div class="admin-search">
+        <input type="text" id="searchInput" placeholder="Cari username, nama, atau NIM…" />
+        <button class="btn-mini" id="btnRefresh">Muat Ulang</button>
+      </div>
+    </div>
+
+    <div class="admin-table-wrap">
+      <table class="admin-table">
+        <thead>
+          <tr>
+            <th>Mahasiswa</th>
+            <th>NIM</th>
+            <th>Prodi</th>
+            <th>Semester</th>
+            <th>IPK</th>
+            <th>Status</th>
+            <th>Saldo SGT</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="mahasiswaTableBody">
+          <tr><td colspan="8" class="admin-empty">Memuat data…</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+  </main>
+
+</div>
+
+<!-- ======================= MODAL DETAIL / EDIT ======================= -->
+<div id="modalOverlay" class="modal-overlay" hidden>
+  <div class="modal-card">
+    <div class="modal-head">
+      <div>
+        <div class="modal-title" id="modalNama">—</div>
+        <div class="modal-sub" id="modalUsername">@—</div>
+      </div>
+      <button class="btn-ghost-sm" id="btnCloseModal">Tutup</button>
+    </div>
+
+    <div class="modal-tabs">
+      <button class="modal-tab active" data-tab="profil">Profil</button>
+      <button class="modal-tab" data-tab="nilai">Nilai</button>
+      <button class="modal-tab" data-tab="sgt">SGT</button>
+    </div>
+
+    <div class="modal-body">
+
+      <div class="modal-pane active" id="paneProfil">
+        <form id="formProfil" class="admin-form">
+          <label>Nama<input type="text" id="fNama" /></label>
+          <label>NIM<input type="text" id="fNim" /></label>
+          <label>Program Studi<input type="text" id="fProdi" /></label>
+          <label>Semester<input type="number" id="fSemester" min="1" max="14" /></label>
+          <label>IPK<input type="number" id="fIpk" min="0" max="4" step="0.01" /></label>
+          <label>Status
+            <select id="fStatus">
+              <option value="aktif">Aktif</option>
+              <option value="cuti">Cuti</option>
+              <option value="lulus">Lulus</option>
+              <option value="nonaktif">Nonaktif</option>
+            </select>
+          </label>
+          <button type="submit" class="btn-primary-sm">Simpan Perubahan</button>
+        </form>
+      </div>
+
+      <div class="modal-pane" id="paneNilai">
+        <div id="nilaiList" class="admin-list"></div>
+        <form id="formNilai" class="admin-form admin-form-inline">
+          <input type="text" id="nMataKuliah" placeholder="Mata kuliah" required />
+          <input type="number" id="nSks" placeholder="SKS" min="1" max="6" style="max-width:80px;" />
+          <input type="text" id="nNilai" placeholder="Nilai (A/B/…)" style="max-width:110px;" required />
+          <input type="number" id="nSemester" placeholder="Semester" min="1" max="14" style="max-width:100px;" required />
+          <button type="submit" class="btn-mini">Tambah</button>
+        </form>
+      </div>
+
+      <div class="modal-pane" id="paneSgt">
+        <div class="admin-balance-row">
+          <div>
+            <div class="label">Saldo tercatat (cache)</div>
+            <div class="value gold" id="sgtSaldoCache">—</div>
+          </div>
+        </div>
+        <form id="formSgtAdjust" class="admin-form admin-form-inline">
+          <select id="sArah">
+            <option value="credit">Tambah (credit)</option>
+            <option value="debit">Kurangi (debit)</option>
+          </select>
+          <input type="number" id="sAmount" placeholder="Jumlah SGT" min="1" step="1" required style="max-width:130px;" />
+          <input type="text" id="sReason" placeholder="Alasan (mis. koreksi nilai)" />
+          <button type="submit" class="btn-mini">Proses</button>
+        </form>
+        <div class="section-label" style="margin-top:24px;">Riwayat Transaksi</div>
+        <div id="sgtTxList" class="admin-list"></div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script src="/js/pi-auth.js"></script>
+<script src="/admin/js/admin.js"></script>
+</body>
+</html>
