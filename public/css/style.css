@@ -42,6 +42,13 @@
 
 * { box-sizing: border-box; }
 
+/* Perbaikan bug: elemen dengan atribut `hidden` HARUS selalu tersembunyi,
+   walaupun class-nya sendiri (mis. .pi-pill, .modal-overlay) memberi
+   `display: flex/block`. Tanpa baris ini, `el.hidden = true` di JS tidak
+   benar-benar menyembunyikan elemen begitu sudah pernah tampil (mis. modal
+   admin yang tidak bisa ditutup lagi). */
+[hidden] { display: none !important; }
+
 html, body {
   margin: 0;
   padding: 0;
